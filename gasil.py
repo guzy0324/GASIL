@@ -2,110 +2,77 @@ import numpy as np
 import torch
 import torch.nn as nn
 from tqdm import tqdm
-
-from torch.distributions import MultivariateNormal
 from torch.optim import Adam
-from network import FeedForwardNN
-from ppo import *
 from queue import PriorityQueue
+
 from good_trajectory import GoodTrajectory
+from mlp_discriminator import Discriminator
+from ppo import PPO
 
 
 class GASIL(PPO):
-    def __init__(self, env):
-        # Initialize hyperparameters
-        self._init_hyperparameters()
-
-        # Extract environment information
-        self.env = env
-        self.obs_dim = env.observation_space.shape[0]
-        self.act_dim = env.action_space.shape[0]
+    def __init__(self, env, conf=dict(), device=torch.device('cpu')):
+        super(GASIL, self).__init__(env, conf, device)
 
         # ALG STEP 1
-        # Initialize networks
-        self.actor = FeedForwardNN(self.obs_dim, self.act_dim)
-        self.critic = FeedForwardNN(self.obs_dim, 1)
-        self.Q = FeedForwardNN(self.obs_dim, 1)
-        self.D = FeedForwardNN(self.obs_dim, 2)
+        # Initialize discriminator network
+        self.D = Discriminator(self.obs_dim + self.act_dim).to(device)
 
-        # Initialize optimizers
-        self.actor_optim = Adam(self.actor.parameters(), lr=self.lr)
-        self.critic_optim = Adam(self.critic.parameters(), lr=self.lr)
-        self.Q = Adam(self.Q.parameters(), lr=self.lr)
-        self.D = Adam(self.D.parameters(), lr=self.lr)
+        # Initialize discriminator optimizer
+        self.D_optim = Adam(self.D.parameters(), lr=self.lr)
 
-        # Create our variable for the matrix.
-        # Note that I chose 0.5 for stdev arbitrarily.
-        self.cov_var = torch.full(size=(self.act_dim,), fill_value=0.5)
-
-        # Create the covariance matrix
-        self.cov_mat = torch.diag(self.cov_var)
+        # Initialize discriminator criterion
+        self.D_criterion = nn.BCELoss()
 
         # Initialize good trajectory buffer B
-        self.B = PriorityQueue(maxsize=self.K)
+        self.B = PriorityQueue()
 
     def learn(self, total_timesteps):
         t_so_far = 0 # Timesteps simulated so far
+        i_so_far = 0 # Iterations ran so far
         pbar = tqdm(total=total_timesteps)
         while t_so_far < total_timesteps: # ALG STEP 2
             # ALG STEP 3
-            batch_obs, batch_acts, batch_log_probs, batch_rtgs, batch_lens = self.rollout()
+            batch_obs, batch_acts, batch_log_probs, batch_rtgs, batch_lens, batch_E_obs, batch_E_acts = self.rollout()
 
             # Calculate how many timesteps we collected this batch
             delta_t = np.sum(batch_lens)
             t_so_far += delta_t
             pbar.update(delta_t)
 
-            # Calculate V_{phi, k}
-            V, _ = self.evaluate(batch_obs, batch_acts)
+            # Increment the number of iterations
+            i_so_far += 1
 
-            # ALG STEP 5
-            # Calculate advantage
-            A_k = batch_rtgs - V.detach()
+            # Logging timesteps so far and iterations so far
+            self.logger['t_so_far'] = t_so_far
+            self.logger['i_so_far'] = i_so_far
 
-            # Normalize advantages
-            A_k = (A_k - A_k.mean()) / (A_k.std() + 1e-10)
+            # Update the discriminator \phi via gradient ascent with:
+            first_g_o = None
+            for _ in range(self.n_updates_of_D_per_iteration):
+                g_o = self.D(torch.cat([batch_obs, batch_acts], 1))
+                if first_g_o is None:
+                    first_g_o = g_o.squeeze(1).detach()
+                e_o = self.D(torch.cat([batch_E_obs, batch_E_acts], 1))
+                self.D_optim.zero_grad()
+                discrim_loss = - self.D_criterion(g_o, torch.ones((batch_obs.shape[0], 1), device=self.device)) - \
+                    self.D_criterion(e_o, torch.zeros((batch_E_obs.shape[0], 1), device=self.device))
+                discrim_loss.backward()
+                self.D_optim.step()
 
-            # ALG STEP 6 & 7
-            for _ in range(self.n_updates_per_iteration):
-                # Calculate pi_theta(s_t | s_t)
-                V, curr_log_probs = self.evaluate(batch_obs, batch_acts)
+            # Modified reward function
+            batch_rtgs = batch_rtgs - self.alpha * torch.log(first_g_o)
 
-                # Calculate ratios
-                ratios = torch.exp(curr_log_probs - batch_log_probs)
+            self.ppo_update(batch_obs, batch_acts, batch_log_probs, batch_rtgs)
 
-                # Calculate surrogate losses
-                surr1 = ratios * A_k
-                surr2 = torch.clamp(ratios, 1 - self.clip, 1 + self.clip) * A_k
-                # Calculate actor loss
-                actor_loss = (-torch.min(surr1, surr2)).mean()
+            # Print a summary of our training so far
+            self._log_summary()
 
-                # Calculate gradients and perform backward propagation for actor network
-                self.actor_optim.zero_grad()
-                actor_loss.backward(retain_graph=True)
-                self.actor_optim.step()
-
-                # Calculate critic loss
-                critic_loss = nn.MSELoss()(V, batch_rtgs)
-
-                # Calculate gradients and perform backward propagation for critic network
-                self.actor_optim.zero_grad()
-                critic_loss.backward()
-                self.actor_optim.step()
-
-    def evaluate(self, batch_obs, batch_acts):
-        # Query critic network for a value V for each obs in batch_obs
-        V = self.critic(batch_obs).squeeze()
-
-        # Calculate the log probabilities of batch actions using most
-        # recent actor network.
-        # This segment of code is similar to that in get_action()
-        mean =  self.actor(batch_obs)
-        dist = MultivariateNormal(mean, self.cov_mat)
-        log_probs = dist.log_prob(batch_acts)
-
-        # Return predicted values V and log probs log_probs
-        return V, log_probs
+            # Save our model if it's time
+            if i_so_far % self.save_freq == 0:
+                torch.save(self.actor.state_dict(), './models_gasil/actor' + str(i_so_far))
+                torch.save(self.critic.state_dict(), './models_gasil/critic' + str(i_so_far))
+                torch.save(self.D.state_dict(), './models_gasil/D' + str(i_so_far))
 
     def rollout(self):
         # Batch data
@@ -115,6 +82,9 @@ class GASIL(PPO):
         batch_rews = [] # batch rewards
         batch_rtgs = [] # batch rewards-to-go
         batch_lens = [] # episodic lengths in batch
+
+        self.actor = self.actor.to(torch.device('cpu'))
+        self.cov_mat = torch.diag(self.cov_var).to(torch.device('cpu'))
 
         # Number of timestpes run so far this batch
         t = 0
@@ -143,54 +113,56 @@ class GASIL(PPO):
             batch_lens.append(ep_t + 1) # plus 1 because timestep starts at 0
             batch_rews.append(ep_rews)
 
+            # Update good trajectory buffer B using \Tau_\pi
+            self.B.put(GoodTrajectory(batch_obs[t - ep_t - 1:t], batch_acts[t - ep_t - 1:t], sum(ep_rews)))
+            if self.B.qsize() > self.K:
+                self.B.get()
+
+        self.actor = self.actor.to(self.device)
+        self.cov_mat = torch.diag(self.cov_var).to(self.device)
+
         # Reshape data as tensors in the shape specified before returning
-        batch_obs = torch.tensor(batch_obs, dtype=torch.float)
-        batch_acts = torch.tensor(batch_acts, dtype=torch.float)
-        batch_log_probs = torch.tensor(batch_log_probs, dtype=torch.float)
+        batch_obs = torch.tensor(batch_obs, dtype=torch.float, device=self.device)
+        batch_acts = torch.tensor(batch_acts, dtype=torch.float, device=self.device)
+        batch_log_probs = torch.tensor(batch_log_probs, dtype=torch.float, device=self.device)
         # ALG STEP #4
-        batch_rtgs = self.compute_rtgs(batch_rews)
+        batch_rtgs = self.compute_rtgs(batch_rews).to(self.device)
+
+        # Log the episodic returns and episodic lengths in this batch.
+        self.logger['batch_rews'] = batch_rews
+        self.logger['batch_lens'] = batch_lens
+
+        # Sample good trajectories \Tau_E ~ B
+        B = [self.B.get() for _ in range(self.B.qsize())]
+        batch_E = np.random.choice(B, size=len(batch_lens), replace=True)
+        for E in B:
+            self.B.put(E)
+
+        # Reshape data as tensors in the shape specified before returning
+        batch_E_obs = list()
+        batch_E_acts = list()
+        for E in batch_E:
+            batch_E_obs.extend(E.obs)
+            batch_E_acts.extend(E.acts)
+        batch_E_obs = torch.tensor(batch_E_obs, dtype=torch.float, device=self.device)
+        batch_E_acts = torch.tensor(batch_E_acts, dtype=torch.float, device=self.device)
 
         # Return the batch data
-        return batch_obs, batch_acts, batch_log_probs, batch_rtgs, batch_lens
-
-    def get_action(self, obs):
-        # Query the actor network for a mean action.
-        # Same thing as calling self.actor.forward(obs)
-        mean = self.actor(obs)
-        # Create our Multivariate Normal Distribution
-        dist = MultivariateNormal(mean, self.cov_mat)
-        # Sample an action from the distribution and get its log prob
-        action = dist.sample()
-        log_prob = dist.log_prob(action)
-        # Return the sampled action and the log prob of that action
-        # Note that I'm calling detach() since the action and log_prob  
-        # are tensors with computation graphs, so I want to get rid
-        # of the graph and just convert the action to numpy array.
-        # log prob as tensor is fine. Our computation graph will
-        # start later down the line.
-        return action.detach().numpy(), log_prob.detach()
-
-    def compute_rtgs(self, batch_rews):
-        # The rewards-to-go (rtg) per episode per batch to return.
-        # The shape will be (num timesteps per episode)
-        batch_rtgs = []
-        # Iterate through each episode backwards to 
-        # in batch_rtgs
-        for ep_rews in reversed(batch_rews):
-            discounted_reward = 0 # The discounted reward so far
-            for rew in reversed(ep_rews):
-                discounted_reward = rew + discounted_reward * self.gamma
-                batch_rtgs.insert(0, discounted_reward)
-        # Convert the rewards-to-go into a tensor
-        batch_rtgs = torch.tensor(batch_rtgs, dtype=torch.float)
-        return batch_rtgs
-
-    def _init_hyperparameters(self):
+        return batch_obs, batch_acts, batch_log_probs, batch_rtgs, batch_lens, batch_E_obs, batch_E_acts
+    
+    def _init_hyperparameters(self, conf):
         # Default values for hyperparameters, will need to change later.
-        self.timesteps_per_batch = 4800 # timesteps per batch
-        self.max_timesteps_per_episode = 1600 # timesteps per episode
-        self.gamma = 0.95 # discount factor
-        self.n_updates_per_iteration = 5 # number of epochs per iteration
-        self.clip = 0.2 # clip threshold as recommended by the paper
-        self.lr = 0.005 # learning rate of optimizers
-        self.K = 10 # size of good trajectory buffer
+        super(GASIL, self)._init_hyperparameters(conf)
+
+        if 'n_updates_of_D_per_iteration' in conf: # number of updates of discriminator per iteration
+            self.n_updates_of_D_per_iteration = conf['n_updates_of_D_per_iteration']
+        else:
+            self.n_updates_of_D_per_iteration = 20
+        if 'K' in conf: # size of good trajectory buffer B
+            self.K = conf['K']
+        else:
+            self.K = 1000
+        if 'alpha' in conf: # weight of log(D)
+            self.alpha = conf['alpha']
+        else:
+            self.alpha = 1
