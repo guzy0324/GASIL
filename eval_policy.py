@@ -1,3 +1,6 @@
+import torch
+
+
 """
 	This file is used only to evaluate our trained policy/actor after
 	training in main.py with ppo.py. I wrote this file to demonstrate
@@ -64,7 +67,7 @@ def rollout(policy, env, render):
 				env.render()
 
 			# Query deterministic action from policy and run it
-			action = policy(obs).detach().numpy()
+			action = policy(torch.tensor(obs, dtype=torch.float)).detach().numpy()
 			obs, rew, done, _ = env.step(action)
 
 			# Sum all episodic rewards as we go along
